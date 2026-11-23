@@ -19,6 +19,7 @@ import (
 	"github.com/purpshell/meowcaller/rtp"
 	"github.com/purpshell/meowcaller/srtp"
 	"github.com/purpshell/meowcaller/stun"
+	"github.com/polymorfa/hypermeow/types"
 	"github.com/rs/zerolog"
 )
 
@@ -93,11 +94,41 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
+	var answerProbes []rlProbe
+	var probeFrom, probeCreator types.JID
 	if !inbound && !m.group && m.electedRelay == "" {
-		// Outbound: the callee's relaylatency probes are answered toward this relay.
-		if ep := getMediaRelayEndpoint(rd, false); ep != nil {
-			m.electedRelay = ep.relayName
+		// Outbound: wait briefly for the callee's relaylatency probes, then allocate on a
+		// relay it also measured. Without probes (timeout), fall back to our first relay.
+		if len(m.peerProbes) == 0 && !m.probeWaitDone {
+			if !m.probeWaitArmed {
+				m.probeWaitArmed = true
+				time.AfterFunc(outboundProbeWait, func() {
+					e.mu.Lock()
+					if cur := e.calls[callID]; cur != nil {
+						cur.probeWaitDone = true
+					}
+					e.mu.Unlock()
+					e.maybeStartMedia(callID)
+				})
+			}
+			e.mu.Unlock()
+			return
 		}
+		m.electedRelay = pickOutboundRelay(rd, m.peerProbes)
+		if m.electedRelay == "" {
+			if ep := getMediaRelayEndpoint(rd, false); ep != nil {
+				m.electedRelay = ep.relayName
+			}
+		}
+		answerProbes = append([]rlProbe(nil), m.peerProbes...)
+		probeFrom, probeCreator = m.probeFrom, m.probeCreator
+		e.c.log.Info().Str("call_id", callID).Str("relay", m.electedRelay).Int("peer_probes", len(answerProbes)).
+			Msg("outbound relay chosen")
+	}
+	if !inbound && !m.group {
+		withElected := *rd
+		withElected.electedRelay = m.electedRelay
+		rd = &withElected
 	}
 	if inbound && !m.group {
 		// No relaylatency probes before Answer: settle the relay now (is_fna, else the
@@ -120,6 +151,10 @@ func (e *engine) maybeStartMedia(callID string) {
 		call.setPhase(CallPhaseConnecting)
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
+	if len(answerProbes) > 0 {
+		elected := rd.electedRelay
+		go e.answerRelayLatency(callID, probeFrom, probeCreator, answerProbes, elected)
+	}
 	go func() {
 		defer clear(callKey)
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
@@ -127,6 +162,10 @@ func (e *engine) maybeStartMedia(callID string) {
 		}
 	}()
 }
+
+// outboundProbeWait bounds how long an outbound call's media start waits for the callee's
+// relaylatency probes (they usually arrive with the preaccept, well under a second).
+const outboundProbeWait = 1500 * time.Millisecond
 
 // connectAndAllocate opens the relay DataChannel and sends the STUN allocate, returning
 // the channel and the allocate bytes (re-sent by the keepalive).

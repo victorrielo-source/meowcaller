@@ -86,6 +86,15 @@ type engineCall struct {
 	// onRelayLatency). Inbound: the offer's is_fna relay, else our offered relay the
 	// caller measured as closest. Outbound: the relay we allocated on at media start.
 	electedRelay string
+
+	// Outbound: the callee's relaylatency probes. Media start waits briefly for them so we
+	// allocate on a relay the callee also measured (see pickOutboundRelay); they are
+	// answered once the relay is chosen.
+	peerProbes     []rlProbe
+	probeFrom      types.JID
+	probeCreator   types.JID
+	probeWaitArmed bool
+	probeWaitDone  bool
 }
 
 // newEngine creates the engine for a Client.
@@ -847,10 +856,26 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 		}
 	}
 	e.mu.Unlock()
+	if outbound {
+		e.mu.Lock()
+		if cur := e.calls[ev.CallID]; cur != nil {
+			cur.peerProbes = mergeProbes(cur.peerProbes, probes)
+			cur.probeFrom, cur.probeCreator = ev.From, ev.CallCreator
+		}
+		e.mu.Unlock()
+	}
 	if outbound && target == "" {
-		// Media has not started yet (no relay): nothing to steer to.
+		// Media has not started yet: the probes pick the relay (maybeStartMedia), which
+		// answers them once it is chosen.
+		e.maybeStartMedia(ev.CallID)
 		return
 	}
+	e.answerRelayLatency(ev.CallID, ev.From, ev.CallCreator, probes, target)
+}
+
+// answerRelayLatency reports our latency for each probed relay: near for target, far for
+// every other one (or the peer's own numbers when there is no target).
+func (e *engine) answerRelayLatency(callID string, from, creator types.JID, probes []rlProbe, target string) {
 	for _, p := range probes {
 		latency := p.latency
 		if target != "" {
@@ -859,22 +884,74 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 				latency = avoidedLatency
 			}
 		}
-		e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", p.relayName).Uint32("peer_latency_ms", p.latency).
+		e.c.log.Debug().Str("call_id", callID).Str("relay_name", p.relayName).Uint32("peer_latency_ms", p.latency).
 			Uint32("reported_latency_ms", latency).Str("target", target).Msg("relaylatency probe answered")
 		resp := signaling.BuildRelayLatency(&signaling.RelayLatencyParams{
-			CallID:       ev.CallID,
-			To:           ev.From,
-			CallCreator:  ev.CallCreator,
+			CallID:       callID,
+			To:           from,
+			CallCreator:  creator,
 			LatencyMs:    latency,
 			RelayName:    p.relayName,
 			AddressBytes: p.addr,
 		})
 		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
 		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
-			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
+			e.c.log.Error().Err(err).Str("call_id", callID).Msg("send relaylatency failed")
 			return
 		}
 	}
+}
+
+// mergeProbes keeps the latest probe per relay.
+func mergeProbes(have, add []rlProbe) []rlProbe {
+	out := append([]rlProbe(nil), have...)
+	for _, p := range add {
+		replaced := false
+		for i := range out {
+			if out[i].relayName == p.relayName {
+				out[i] = p
+				replaced = true
+			}
+		}
+		if !replaced {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pickOutboundRelay chooses, for an outbound 1:1 call, a relay the callee probed and we
+// hold a token for, minimizing our c2r_rtt plus the callee's latency. Allocating on our
+// own first relay instead (the old behavior) fails when the callee never probes it: the
+// election lands elsewhere and no inbound RTP ever arrives (seen calling a phone in
+// Brazil from a Miami server: we took mia3c02, the phone only probed gru2c01, gig4c01 and
+// mia3c03). Empty when the probes name none of our relays.
+func pickOutboundRelay(rd *relayData, probes []rlProbe) string {
+	if rd == nil {
+		return ""
+	}
+	best, bestScore := "", uint32(0)
+	for _, p := range probes {
+		if p.latency == 0 || p.latency >= avoidedLatency {
+			continue
+		}
+		for _, ep := range rd.endpoints {
+			if ep.relayName != p.relayName || ep.isFNA || len(ep.addresses) == 0 {
+				continue
+			}
+			if int(ep.tokenID) >= len(rd.relayTokens) || len(rd.relayTokens[ep.tokenID]) == 0 {
+				continue
+			}
+			rtt := ep.c2rRTT
+			if rtt == 0 {
+				rtt = 150
+			}
+			if score := rtt + p.latency; best == "" || score < bestScore {
+				best, bestScore = ep.relayName, score
+			}
+		}
+	}
+	return best
 }
 
 // Latencies we report to steer the 1:1 relay election (see onRelayLatency).
@@ -1751,6 +1828,14 @@ func parseRelayData(node *waBinary.Node) *relayData {
 // FNA-marked relay, so we must allocate on that same relay or the relay never bridges the
 // peer's media (the callee connects but hears nothing).
 func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
+	if !inbound && rd.electedRelay != "" {
+		// Outbound: the relay pickOutboundRelay chose from the callee's probes.
+		for i := range rd.endpoints {
+			if e := &rd.endpoints[i]; e.relayName == rd.electedRelay && !e.isFNA {
+				return e
+			}
+		}
+	}
 	if inbound {
 		for i := range rd.endpoints {
 			if e := &rd.endpoints[i]; e.isFNA {
