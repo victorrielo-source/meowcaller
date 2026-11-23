@@ -87,14 +87,14 @@ type engineCall struct {
 	// caller measured as closest. Outbound: the relay we allocated on at media start.
 	electedRelay string
 
-	// Outbound: the callee's relaylatency probes. Media start waits briefly for them so we
-	// allocate on a relay the callee also measured (see pickOutboundRelay); they are
-	// answered once the relay is chosen.
-	peerProbes     []rlProbe
-	probeFrom      types.JID
-	probeCreator   types.JID
-	probeWaitArmed bool
-	probeWaitDone  bool
+	// Outbound: the callee's relaylatency probes. They only arrive after our media is up;
+	// when they don't name the relay we allocated on, media moves once to a relay they do
+	// name (see onRelayLatency / pickOutboundRelay).
+	peerProbes    []rlProbe
+	probeFrom     types.JID
+	probeCreator  types.JID
+	relaySwitched bool
+	mediaDone     chan struct{} // closed when the current media goroutine exits
 }
 
 // newEngine creates the engine for a Client.
@@ -855,22 +855,61 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			target = m.electedRelay
 		}
 	}
-	e.mu.Unlock()
+	var switchFrom string
+	var oldMedia chan struct{}
 	if outbound {
-		e.mu.Lock()
 		if cur := e.calls[ev.CallID]; cur != nil {
 			cur.peerProbes = mergeProbes(cur.peerProbes, probes)
 			cur.probeFrom, cur.probeCreator = ev.From, ev.CallCreator
+			// The callee never measured the relay we are on: the election would land on one
+			// of its relays and its media would never reach us. Move once to a shared relay.
+			if cur.started && cur.electedRelay != "" && !cur.relaySwitched && !probesName(cur.peerProbes, cur.electedRelay) {
+				if pick := pickOutboundRelay(cur.relay, cur.peerProbes); pick != "" && pick != cur.electedRelay {
+					switchFrom = cur.electedRelay
+					cur.relaySwitched = true
+					cur.electedRelay = pick
+					target = pick
+					oldMedia = cur.mediaDone
+					if cur.cancel != nil {
+						cur.cancel()
+					}
+				}
+			}
 		}
-		e.mu.Unlock()
+	}
+	e.mu.Unlock()
+	if switchFrom != "" {
+		e.c.log.Info().Str("call_id", ev.CallID).Str("from_relay", switchFrom).Str("to_relay", target).
+			Msg("callee did not probe our relay; moving outbound media to a shared relay")
+		go func(callID string, done chan struct{}) {
+			if done != nil {
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+				}
+			}
+			e.mu.Lock()
+			if cur := e.calls[callID]; cur != nil {
+				cur.started = false
+			}
+			e.mu.Unlock()
+			e.maybeStartMedia(callID)
+		}(ev.CallID, oldMedia)
 	}
 	if outbound && target == "" {
-		// Media has not started yet: the probes pick the relay (maybeStartMedia), which
-		// answers them once it is chosen.
-		e.maybeStartMedia(ev.CallID)
+		// Media has not started yet (no relay): nothing to steer to.
 		return
 	}
 	e.answerRelayLatency(ev.CallID, ev.From, ev.CallCreator, probes, target)
+}
+
+func probesName(probes []rlProbe, relayName string) bool {
+	for _, p := range probes {
+		if p.relayName == relayName {
+			return true
+		}
+	}
+	return false
 }
 
 // answerRelayLatency reports our latency for each probed relay: near for target, far for
